@@ -1,73 +1,174 @@
+```sh
 #!/bin/sh
+set -eu
 
-echo 'Starting up Tailscale...'
+log() { printf '%s\n' "$*"; }
 
-# Enable IPv4 and IPv6 forwarding
-echo 'Enabling IP forwarding...'
-echo 'net.ipv4.ip_forward = 1' | tee -a /etc/sysctl.conf
-echo 'net.ipv6.conf.all.forwarding = 1' | tee -a /etc/sysctl.conf
-sysctl -p /etc/sysctl.conf
+is_true() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|y|Y|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
-# Configure NAT for IPv4 and IPv6
-echo 'Configuring NAT...'
-if iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE; then
-    echo "IPv4 NAT configured successfully."
+# Fly.io region -> human-ish city
+deabbreviate() {
+  case "${1:-}" in
+    ams) echo "amsterdam" ;;
+    arn) echo "stockholm" ;;
+    atl) echo "atlanta" ;;
+    bog) echo "colombia-bogota" ;;
+    bom) echo "mumbai" ;;
+    bos) echo "boston" ;;
+    cdg) echo "paris" ;;
+    den) echo "denver" ;;
+    dfw) echo "dallas" ;;
+    ewr) echo "new-york-city" ;;
+    eze) echo "argentina-ezeiza" ;;
+    fra) echo "frankfurt" ;;
+    gdl) echo "mexico-guadalajara" ;;
+    gig) echo "rio-de-janeiro" ;;
+    gru) echo "sao-paulo" ;;
+    hkg) echo "hong-kong" ;;
+    iad) echo "virginia-ashburn" ;;
+    jnb) echo "johannesburg" ;;
+    lax) echo "los-angeles" ;;
+    lhr) echo "london" ;;
+    mad) echo "madrid" ;;
+    mia) echo "miami" ;;
+    nrt) echo "tokyo" ;;
+    ord) echo "chicago" ;;
+    otp) echo "romania-bucharest" ;;
+    phx) echo "phoenix" ;;
+    qro) echo "mexico-queretaro" ;;
+    scl) echo "chile-santiago" ;;
+    sea) echo "seattle" ;;
+    sin) echo "singapore" ;;
+    sjc) echo "san-jose" ;;
+    syd) echo "sydney" ;;
+    waw) echo "warsaw" ;;
+    yul) echo "montreal" ;;
+    yyz) echo "toronto" ;;
+    *) echo "unknown" ;;
+  esac
+}
+
+log "Starting up Tailscale..."
+
+# --- required creds ---
+TS_AUTHKEY_FINAL="${TS_AUTHKEY:-${TAILSCALE_AUTH_KEY:-}}"
+if [ -z "${TS_AUTHKEY_FINAL}" ]; then
+  log "ERROR: TS_AUTHKEY (or TAILSCALE_AUTH_KEY) is required"
+  exit 1
+fi
+
+# login server (headscale) - optional
+TS_LOGIN_SERVER="${HS:-}"
+
+# --- behavior knobs ---
+# - TS_ADVERTISE_EXIT_NODE=1 enables exit-node mode
+# - If FLY_REGION is set: force hostname to region(city) + force exit-node mode + ignore TS_HOSTNAME
+EXIT_ENABLED=0
+if [ -n "${FLY_REGION:-}" ]; then
+  EXIT_ENABLED=1
+  city="$(deabbreviate "$FLY_REGION")"
+  TS_HOSTNAME_FINAL="flyio-${city}"
+  log "FLY_REGION detected (${FLY_REGION}) -> city=${city} -> forcing hostname=${TS_HOSTNAME_FINAL} and enabling exit-node"
 else
-    echo "Failed to set IPv4 NAT. Are iptables installed and configured correctly?"
+  TS_HOSTNAME_FINAL="${TS_HOSTNAME:-$(hostname 2>/dev/null || echo "tailscale-connector")}"
+  if is_true "${TS_ADVERTISE_EXIT_NODE:-0}"; then
+    EXIT_ENABLED=1
+  fi
+  log "No FLY_REGION -> hostname=${TS_HOSTNAME_FINAL} exit-node=${EXIT_ENABLED}"
 fi
 
-if ip6tables -t nat -A POSTROUTING -o eth0 -j MASQUERADE; then
-    echo "IPv6 NAT configured successfully."
+# --- always-on forwarding + NAT ---
+log "Enabling IP forwarding..."
+if command -v sysctl >/dev/null 2>&1; then
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
+fi
+
+# optional: try to load xt_mark (non-fatal)
+if command -v modprobe >/dev/null 2>&1; then
+  modprobe xt_mark >/dev/null 2>&1 || true
+fi
+
+log "Configuring NAT (MASQUERADE on eth0)..."
+if command -v iptables >/dev/null 2>&1; then
+  iptables -t nat -C POSTROUTING -o eth0 -j MASQUERADE >/dev/null 2>&1 \
+    || iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE >/dev/null 2>&1 \
+    || log "WARN: IPv4 NAT failed (iptables)"
 else
-    echo "Failed to set IPv6 NAT. Are ip6tables installed and configured correctly?"
+  log "WARN: iptables not found; skipping IPv4 NAT"
 fi
 
-# Start tailscaled with userspace networking
-echo 'Starting tailscaled...'
-if /app/tailscaled --tun=userspace-networking --verbose=1 --port 41641 & then
-    echo "tailscaled started successfully."
+if command -v ip6tables >/dev/null 2>&1; then
+  ip6tables -t nat -C POSTROUTING -o eth0 -j MASQUERADE >/dev/null 2>&1 \
+    || ip6tables -t nat -A POSTROUTING -o eth0 -j MASQUERADE >/dev/null 2>&1 \
+    || log "WARN: IPv6 NAT failed (ip6tables)"
 else
-    echo "Failed to start tailscaled."
-    exit 1
+  log "WARN: ip6tables not found; skipping IPv6 NAT"
 fi
 
-sleep 5
+# --- start tailscaled (userspace + netfilter off to avoid MARK errors) ---
+log "Starting tailscaled..."
+/app/tailscaled --tun=userspace-networking --verbose=1 --port 41641 &
+TAILSCALED_PID="$!"
 
-# Check for tailscaled socket
-if [ ! -S /var/run/tailscale/tailscaled.sock ]; then
-    echo "tailscaled.sock does not exist. exit!"
-    exit 1
-fi
-
-# Attempt to bring up Tailscale interface
-echo 'Bringing up Tailscale interface...'
-until /app/tailscale up \
-    --login-server="${HS}" \
-    --authkey="${TS_AUTHKEY}" \
-    --hostname="${TS_HOSTNAME}" \
-    --advertise-exit-node \
-    --netfilter-mode=off; do
-    echo "Retrying Tailscale up..."
-    sleep 1
+# wait for socket
+SOCK="/var/run/tailscale/tailscaled.sock"
+i=0
+while [ $i -lt 60 ]; do
+  [ -S "$SOCK" ] && break
+  i=$((i+1))
+  sleep 0.5
 done
 
-echo 'Tailscale started successfully.'
-
-echo 'Starting Squid...'
-if squid & then
-    echo "Squid started successfully."
-else
-    echo "Failed to start Squid."
-    exit 1
+if [ ! -S "$SOCK" ]; then
+  log "ERROR: tailscaled.sock does not exist at $SOCK"
+  kill "$TAILSCALED_PID" 2>/dev/null || true
+  exit 1
 fi
 
-echo 'Starting Dante...'
-if sockd & then
-    echo "Dante started successfully."
-else
-    echo "Failed to start Dante."
-    exit 1
+# --- tailscale up ---
+UP_ARGS="--authkey=${TS_AUTHKEY_FINAL} --hostname=${TS_HOSTNAME_FINAL} --netfilter-mode=off"
+if [ -n "$TS_LOGIN_SERVER" ]; then
+  UP_ARGS="${UP_ARGS} --login-server=${TS_LOGIN_SERVER}"
+fi
+if [ "$EXIT_ENABLED" -eq 1 ]; then
+  UP_ARGS="${UP_ARGS} --advertise-exit-node"
 fi
 
-echo 'All services started successfully.'
+log "Bringing up Tailscale..."
+until /app/tailscale up ${UP_ARGS}; do
+  log "Retrying tailscale up..."
+  sleep 1
+done
+log "Tailscale started"
+
+# --- services (start them all if installed) ---
+start_bg() {
+  name="$1"; shift
+  if command -v "$1" >/dev/null 2>&1; then
+    log "Starting ${name}..."
+    "$@" &
+    log "${name} started"
+  else
+    log "WARN: ${name} not started (missing: $1)"
+  fi
+}
+
+start_bg "Squid" squid
+start_bg "Dante" sockd
+start_bg "dnsmasq" dnsmasq
+
+cleanup() {
+  log "Shutting down..."
+  kill "$TAILSCALED_PID" 2>/dev/null || true
+  exit 0
+}
+trap cleanup INT TERM
+
 sleep infinity
+```
